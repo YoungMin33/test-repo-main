@@ -177,7 +177,10 @@ const state={
 /* ── 채점 ── */
 function sigmoid(x){return 1/(1+Math.exp(-x))}
 
-function scoreAnswer(answer,mission){
+const ANTHROPIC_API_KEY = "여기에_API_키_입력";
+
+// 기존 키워드 채점 (Fallback용)
+function scoreAnswerKeyword(answer, mission){
   const txt=(answer||'').toLowerCase();
   const out={};
   AXES.forEach(ax=>{
@@ -187,6 +190,79 @@ function scoreAnswer(answer,mission){
     out[ax]=sigmoid((n-kws.length*0.3)/(kws.length*0.3+0.01))*(mission.axis_signals[ax]||0);
   });
   return out;
+}
+
+// LLM 채점 (메인)
+async function scoreAnswer(answer, mission){
+  if(!answer||answer.trim().length<10) return scoreAnswerKeyword(answer, mission);
+
+  const systemPrompt = `당신은 직무적성 평가 전문가입니다. 사용자가 직무 시뮬레이션 미션에 제출한 답변을 5가지 사고방식 축으로 평가합니다.
+
+[5가지 축 정의]
+AX1 | 정보분석·논리: 수치/데이터/통계를 근거로 논리적 추론을 전개했는가?
+AX2 | 관찰·탐색: 현상을 구체적으로 관찰하고 세부 사항을 탐색했는가?
+AX3 | 전략·판단: 우선순위를 정하고 전략적 방향이나 의사결정을 제시했는가?
+AX4 | 리더십·조직: 팀/조직/이해관계자를 고려한 협업·보고·지시 요소가 있는가?
+AX5 | 대인서비스: 상대방의 감정·필요를 배려하고 소통을 중시했는가?
+
+[채점 규칙]
+1. 각 축을 0.0~1.0 사이 소수점 한 자리로 독립적으로 평가하세요.
+2. 점수 기준: 0.0(전혀 없음) / 0.3(단순 언급만) / 0.5(표면적) / 0.7(구체적·맥락 적합) / 1.0(핵심적으로 드러남)
+3. 키워드 유무가 아닌 실제 사고방식이 발휘되었는지를 기준으로 평가하세요.
+4. 루브릭은 참고용입니다. 동의어나 의미상 동등한 표현도 동일하게 인정하세요.
+5. 답변의 길이나 문체가 아닌 내용의 질로만 평가하세요.
+6. 각 축에 대해 1문장의 근거를 한국어로 작성하세요.
+
+[응답 형식 — 반드시 아래 JSON만 출력, 마크다운 없이]
+{"scores":{"AX1":0.0,"AX2":0.0,"AX3":0.0,"AX4":0.0,"AX5":0.0},"reasoning":{"AX1":"근거","AX2":"근거","AX3":"근거","AX4":"근거","AX5":"근거"}}`;
+
+  const userPrompt = `[미션 정보]
+직업: ${mission.job_name}
+미션: ${mission.title}
+시나리오: ${mission.scenario}
+과제: ${mission.task}
+
+[채점 참고 기준 — 참고용, 동의어도 인정]
+AX1 관련 요소: ${(mission.rubric.AX1||[]).join(', ')}
+AX2 관련 요소: ${(mission.rubric.AX2||[]).join(', ')}
+AX3 관련 요소: ${(mission.rubric.AX3||[]).join(', ')}
+AX4 관련 요소: ${(mission.rubric.AX4||[]).join(', ')}
+AX5 관련 요소: ${(mission.rubric.AX5||[]).join(', ')}
+
+[사용자 답변]
+${answer}
+
+위 답변을 5축 기준으로 평가하세요.`;
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 600,
+        system: systemPrompt,
+        messages: [{role:'user', content:userPrompt}]
+      })
+    });
+    const data = await res.json();
+    let text = (data.content?.[0]?.text||'').replace(/```json|```/g,'').trim();
+    const parsed = JSON.parse(text);
+    const out = {};
+    AXES.forEach(ax=>{
+      out[ax] = (parsed.scores[ax]||0) * (mission.axis_signals[ax]||0);
+    });
+    out._reasoning = parsed.reasoning;
+    return out;
+  } catch(e) {
+    console.warn('LLM 채점 실패, 키워드 채점으로 전환:', e);
+    return scoreAnswerKeyword(answer, mission);
+  }
 }
 
 function computeProfile(list){
@@ -564,11 +640,13 @@ function bindEvents(){
     el.closest('.sr-opts').querySelectorAll('.sr-btn').forEach(b=>b.classList.remove('sel'));
     el.classList.add('sel');refreshBtn();
   }));
-  S('btn-mnext')?.addEventListener('click',()=>{
+  S('btn-mnext')?.addEventListener('click', async ()=>{
     const m=curMission();if(!m)return;
     const ans=m.input_type==='multiple_choice'?(m.options[state.selectedOption]||''):state.missionAnswer;
     if(!state.missionScores[m.job_code])state.missionScores[m.job_code]=[];
-    state.missionScores[m.job_code].push(scoreAnswer(ans,m));
+    const btn=S('btn-mnext');if(btn){btn.disabled=true;btn.textContent='채점 중...';}
+    const score = await scoreAnswer(ans, m);
+    state.missionScores[m.job_code].push(score);
     advance();
   });
   S('btn-restart')?.addEventListener('click',()=>{
